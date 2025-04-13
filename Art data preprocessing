@@ -1,0 +1,155 @@
+import numpy as np
+import torch
+import torch.nn as nn
+from torchvision import datasets, transforms
+from torch.utils.data.sampler import SubsetRandomSampler
+import os
+import kagglehub
+from tqdm import tqdm
+
+# Device configuration
+device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
+
+########################### Loading the data and standardisation ###########################
+# Download the Impressionist dataset
+os.environ['KAGGLE_CONFIG_DIR'] = '/home3/xzjx92/kaggle'
+path = kagglehub.dataset_download("delayedkarma/impressionist-classifier-data")
+
+# Paths for the dataset
+training_path = '/home3/xzjx92/.cache/kagglehub/datasets/delayedkarma/impressionist-classifier-data/versions/1/training/training'
+validation_path = '/home3/xzjx92/.cache/kagglehub/datasets/delayedkarma/impressionist-classifier-data/versions/1/validation/validation'
+
+def data_loader(batch_size=32, random_seed=2025, shuffle=True):
+
+    np.random.seed(random_seed)
+    torch.manual_seed(random_seed)
+
+    # Calculate mean and std from training data
+    print("Calculating mean and std from training data...")
+    transform_for_stats = transforms.Compose([
+        transforms.Resize((224, 224)),
+        transforms.ToTensor(),
+    ])
+    
+    train_dataset_stats = datasets.ImageFolder(root=training_path, transform=transform_for_stats)
+    
+    #mean = 0.0
+    #std = 0.0
+    #for images, _ in tqdm(train_dataset_stats):
+    #    mean += images.mean([1, 2])
+    #   std += images.std([1, 2])
+    
+    #mean /= len(train_dataset_stats)
+    #std /= len(train_dataset_stats)
+    
+    #print(f"Calculated mean: {mean}")
+    #print(f"Calculated std: {std}")
+
+    # Define transformations for data augmentation
+    train_transform = transforms.Compose([
+        transforms.RandomHorizontalFlip(),
+        transforms.RandomVerticalFlip(),
+        transforms.ColorJitter(0.2, 0.2, 0.2),
+        transforms.Resize((224, 224)),
+        transforms.ToTensor(),
+        transforms.Normalize(mean = [0.5229, 0.4610, 0.3803], 
+                             std = [0.2049, 0.1918, 0.1819]),
+    ])
+
+    basic_transform = transforms.Compose([
+        transforms.Resize((224, 224)),
+        transforms.ToTensor(),
+        transforms.Normalize(mean = [0.5229, 0.4610, 0.3803], 
+                             std = [0.2049, 0.1918, 0.1819]),
+    ])
+
+    # Load datasets
+    train_dataset = datasets.ImageFolder(training_path, transform=train_transform)
+    valid_dataset = datasets.ImageFolder(validation_path, transform=basic_transform)
+
+    # Split validation into validation/test, 80% training, 10% val, 10% test
+    num_valid = len(valid_dataset)
+    valid_indices = np.arange(num_valid)
+    np.random.shuffle(valid_indices)
+    split = num_valid // 2
+    
+    valid_loader = torch.utils.data.DataLoader(
+        valid_dataset,
+        batch_size=batch_size,
+        sampler=SubsetRandomSampler(valid_indices[:split])
+    )
+    
+    test_loader = torch.utils.data.DataLoader(
+        valid_dataset,
+        batch_size=batch_size,
+        sampler=SubsetRandomSampler(valid_indices[split:])
+    )
+
+    # Training loader (with shuffling)
+    train_loader = torch.utils.data.DataLoader(
+        train_dataset,f
+        batch_size=batch_size,
+        shuffle=shuffle,
+        num_workers=2
+    )
+
+    return train_loader, valid_loader, test_loader
+
+# Initialize data loaders
+train_loader, valid_loader, test_loader = data_loader(batch_size=32)
+
+print("\nData loading complete!")
+print(f"Training batches: {len(train_loader)}")
+print(f"Validation batches: {len(valid_loader)}")
+print(f"Test batches: {len(test_loader)}")
+
+
+import os
+import torch
+import imagehash
+from PIL import Image
+
+########################## data cleaning ########################## 
+def extract_file_paths(loader):
+    """Extract image file paths from a DataLoader."""
+    dataset = loader.dataset  
+    sampler_indices = loader.sampler.indices if isinstance(loader.sampler, torch.utils.data.SubsetRandomSampler) else range(len(dataset))
+    return [dataset.samples[i][0] for i in sampler_indices]
+
+def remove_duplicate_images(image_paths):
+    """Compute hashes and delete duplicate images, keeping only one copy."""
+    hashes = {}
+    
+    for img_path in image_paths:
+        img = Image.open(img_path)
+        img_hash = imagehash.phash(img)
+        img.close()  # Close image to avoid resource leaks
+
+        if img_hash in hashes:
+            print(f"bin: Removing duplicate: {img_path}")
+            os.remove(img_path)  # Delete duplicate image
+        else:
+            hashes[img_hash] = img_path  # Store first occurrence
+
+def clean_dataset(train_loader, valid_loader, test_loader):
+    """Find and remove duplicates across dataset splits."""
+    # Get file paths
+    train_files = extract_file_paths(train_loader)
+    valid_files = extract_file_paths(valid_loader)
+    test_files = extract_file_paths(test_loader)
+
+    # Combine all file paths and process
+    all_files = train_files + valid_files + test_files
+    remove_duplicate_images(all_files)
+
+# Run the cleaning process
+clean_dataset(train_loader, valid_loader, test_loader)
+
+
+######################### Get the class names from the training dataset #########################
+class_names = train_loader.dataset.classes
+
+# Print each class name with its index
+for idx, artist_name in enumerate(class_names):
+    print(f"Class Index {idx}: {artist_name}")
+
