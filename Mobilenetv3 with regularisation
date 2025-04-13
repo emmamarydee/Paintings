@@ -1,0 +1,202 @@
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torchvision import models
+from torch.optim import lr_scheduler
+import os
+import csv
+import json
+from tqdm import tqdm
+import numpy as np
+from skopt import Optimizer
+from skopt.space import Integer, Real, Categorical
+
+RESULTS_FILE = "bayesian_optimisation_results_mobilenet_art.csv"
+CHECKPOINT_FILE = "optimization_checkpoint.json"
+LR_PATIENCE = 2
+ES_PATIENCE = 5
+CHECKPOINT_INTERVAL = 5  # Save checkpoint every 5 epochs
+
+def set_seed(seed=2025):
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    np.random.seed(seed)
+    torch.backends.cudnn.deterministic = True
+
+def train_mobilenetv3_with_hyperparameters(layers_to_unfreeze, learning_rate, num_epochs, dropout_rate, l1_reg, l2_reg, 
+                                           log_file="training_log_art_mobilenet.csv", checkpoint_dir="checkpoints_mobilenet"):
+    try:
+        set_seed()
+        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        model = models.mobilenet_v3_large(weights=models.MobileNet_V3_Large_Weights.DEFAULT)
+
+        last_channel = model.classifier[0].in_features
+        model.classifier = nn.Sequential(
+            nn.Linear(last_channel, 256),
+            nn.ReLU(),
+            nn.Dropout(dropout_rate),
+            nn.Linear(256, 10)
+        )
+
+        for param in model.features.parameters():
+            param.requires_grad = False
+        for layer in list(model.features.children())[-layers_to_unfreeze:]:
+            for param in layer.parameters():
+                param.requires_grad = True
+
+        model = model.to(device)
+        criterion = nn.CrossEntropyLoss().to(device)
+        optimizer = optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=l2_reg)
+        scheduler = lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.25, patience=LR_PATIENCE, verbose=True, min_lr=1e-8)
+
+        os.makedirs(checkpoint_dir, exist_ok=True)
+        history = {'train_loss': [], 'train_accuracy': [], 'valid_loss': [], 'valid_accuracy': [], 'learning_rate': []}
+        best_valid_loss = float('inf')
+        early_stopping_counter = 0
+
+        # Load checkpoint if exists
+        start_epoch = 0
+        checkpoint_path = os.path.join(checkpoint_dir, "latest_checkpoint.pt")
+        if os.path.exists(checkpoint_path):
+            checkpoint = torch.load(checkpoint_path)
+            model.load_state_dict(checkpoint['model_state_dict'])
+            optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+            start_epoch = checkpoint['epoch']
+            best_valid_loss = checkpoint['best_valid_loss']
+            history = checkpoint['history']
+            print(f"Resuming from epoch {start_epoch}")
+
+        for epoch in range(start_epoch, num_epochs):
+            model.train()
+            running_loss, correct, total = 0.0, 0, 0
+
+            for inputs, labels in tqdm(train_loader, desc=f"Epoch {epoch+1}/{num_epochs} [Train]"):
+                inputs, labels = inputs.to(device), labels.to(device)
+                optimizer.zero_grad()
+                outputs = model(inputs)
+                loss = criterion(outputs, labels)
+
+                l1_norm = sum(p.abs().sum() for p in model.parameters() if p.requires_grad and len(p.shape) > 1)
+                loss += l1_reg * l1_norm
+
+                loss.backward()
+                optimizer.step()
+
+                running_loss += loss.item()
+                _, predicted = torch.max(outputs, 1)
+                correct += (predicted == labels).sum().item()
+                total += labels.size(0)
+
+            train_accuracy = 100 * correct / total
+            train_loss = running_loss / len(train_loader)
+            history['train_loss'].append(train_loss)
+            history['train_accuracy'].append(train_accuracy)
+
+            model.eval()
+            valid_loss, correct, total = 0.0, 0, 0
+            with torch.no_grad():
+                for inputs, labels in tqdm(valid_loader, desc=f"Epoch {epoch+1}/{num_epochs} [Valid]"):
+                    inputs, labels = inputs.to(device), labels.to(device)
+                    outputs = model(inputs)
+                    loss = criterion(outputs, labels)
+                    valid_loss += loss.item()
+                    _, predicted = torch.max(outputs, 1)
+                    correct += (predicted == labels).sum().item()
+                    total += labels.size(0)
+
+            valid_accuracy = 100 * correct / total
+            valid_loss /= len(valid_loader)
+            history['valid_loss'].append(valid_loss)
+            history['valid_accuracy'].append(valid_accuracy)
+
+            scheduler.step(valid_loss)
+            current_lr = optimizer.param_groups[0]['lr']
+            history['learning_rate'].append(current_lr)
+
+            print(f"Epoch {epoch+1}: Train Loss: {train_loss:.4f}, Train Acc: {train_accuracy:.2f}%, Valid Loss: {valid_loss:.4f}, Valid Acc: {valid_accuracy:.2f}%")
+
+            if valid_loss < best_valid_loss:
+                best_valid_loss = valid_loss
+                early_stopping_counter = 0
+                best_model_path = os.path.join(checkpoint_dir, "best_model.pt")
+                torch.save({'model_state_dict': model.state_dict(), 'valid_loss': valid_loss}, best_model_path)
+                print(f"New best model saved with validation loss: {valid_loss:.4f}")
+            else:
+                early_stopping_counter += 1
+
+            # Save checkpoint every CHECKPOINT_INTERVAL epochs
+            if (epoch + 1) % CHECKPOINT_INTERVAL == 0:
+                torch.save({
+                    'epoch': epoch + 1,
+                    'model_state_dict': model.state_dict(),
+                    'optimizer_state_dict': optimizer.state_dict(),
+                    'best_valid_loss': best_valid_loss,
+                    'history': history
+                }, checkpoint_path)
+                print(f"Checkpoint saved at epoch {epoch + 1}")
+
+            if early_stopping_counter >= ES_PATIENCE:
+                print(f"Early stopping triggered after {ES_PATIENCE} epochs without improvement.")
+                break
+
+        return best_valid_loss  
+
+    except Exception as e:
+        print(f"Training error: {str(e)}")
+        return float('inf')
+
+# Define search space
+dimensions = [
+    Integer(2, 15, name='layers_to_unfreeze'),
+    Real(1e-5, 1e-2, 'log-uniform', name='learning_rate'),
+    Integer(20, 50, name='num_epochs'),
+    Real(0.1, 0.5, name='dropout_rate'),
+    Real(1e-8, 1e-3, 'log-uniform', name='l1_reg'),
+    Real(1e-8, 1e-3, 'log-uniform', name='l2_reg'),
+]
+
+optimizer = Optimizer(
+    dimensions=dimensions,
+    base_estimator="GP",
+    acq_func="EI",
+    acq_optimizer="auto",
+    n_initial_points=20,
+    random_state=2025
+)
+
+# Bayesian Optimization
+n_calls = 20
+results = []
+
+def objective(params):
+    return train_mobilenetv3_with_hyperparameters(*params)
+
+for i in range(n_calls):
+    print(f"\nIteration {i+1}/{n_calls}")
+    suggested_params = optimizer.ask()
+    validation_loss = objective(suggested_params)
+    
+    if validation_loss != float('inf'):
+        results.append(suggested_params + [validation_loss])
+        optimizer.tell(suggested_params, validation_loss)
+
+        # Save results
+        with open(RESULTS_FILE, mode="w", newline="") as file:
+            writer = csv.writer(file)
+            writer.writerow(["layers_to_unfreeze", "learning_rate", "num_epochs", "dropout_rate", "l1_reg", "l2_reg", "validation_loss"])
+            writer.writerows(results)
+
+print("Optimisation finished.")
+
+#Print best parameters
+if results:
+    best_idx = np.argmin([r[-1] for r in results])
+    best_params = results[best_idx]
+    print("\nBest hyperparameters found:")
+    print(f"Layers to unfreeze: {int(best_params[0])}")
+    print(f"Learning rate: {best_params[1]:.6f}")
+    print(f"Number of epochs: {int(best_params[2])}")
+    print(f"Dropout rate: {best_params[3]:.4f}")
+    print(f"L1 reg: {best_params[4]:.6f}")
+    print(f"L2 reg: {best_params[5]:.6f}")
+    print(f"Validation loss: {best_params[6]:.4f}")
