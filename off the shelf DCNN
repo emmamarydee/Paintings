@@ -1,0 +1,205 @@
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torchvision import models
+from torch.optim import lr_scheduler
+from tqdm import tqdm
+import csv
+import os
+from torchvision.models import ResNet50_Weights, MobileNet_V3_Large_Weights, EfficientNet_B3_Weights, ResNet18_Weights, VGG19_Weights
+import pandas as pd
+
+
+############## off-the-shelf transfer learning with pre-trained DCNNs ##############
+
+models_dict = {
+    "resnet50": models.resnet50(weights=ResNet50_Weights.DEFAULT),
+    "mobilenet_v3": models.mobilenet_v3_large(weights=MobileNet_V3_Large_Weights.DEFAULT),
+    "efficientnet_b3": models.efficientnet_b3(weights=EfficientNet_B3_Weights.DEFAULT),
+    "resnet18": models.resnet18(weights=ResNet18_Weights.DEFAULT),
+    "vgg19": models.vgg19(weights=VGG19_Weights.DEFAULT),
+}
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+# Define training parameters
+num_epochs = 20
+patience = 2  # Early stopping patience
+best_loss = float('inf')
+epochs_no_improve = 0
+
+train_results = []
+test_results = []
+
+# Loop over each model
+for model_name, model in models_dict.items():
+    print(f"\nTraining {model_name}...")
+
+    # Modify the final FC layer for each model to have 10 output classes
+    if model_name == "resnet50":
+        model.fc = nn.Linear(2048, 10) 
+    elif model_name == "mobilenet_v3":
+        model.classifier[3] = nn.Linear(1280, 10) 
+    elif model_name == "efficientnet_b3":
+        model.classifier[1] = nn.Linear(1536, 10) 
+    elif model_name == "resnet18":
+        model.fc = nn.Linear(512, 10) 
+    elif model_name == "vgg19":
+        model.classifier[6] = nn.Linear(4096, 10) 
+
+    # Move model to device (GPU/CPU)
+    model = model.to(device)
+
+    # Freeze all parameters except the final layer
+    for param in model.parameters():
+        param.requires_grad = False
+
+    # Unfreeze the final layer parameters
+    if model_name == "resnet50":
+        for param in model.fc.parameters():
+            param.requires_grad = True
+    elif model_name == "mobilenet_v3":
+        for param in model.classifier.parameters():
+            param.requires_grad = True
+    elif model_name == "efficientnet_b3":
+        for param in model.classifier.parameters():
+            param.requires_grad = True
+    elif model_name == "resnet18":
+        for param in model.fc.parameters():
+            param.requires_grad = True
+    elif model_name == "vgg19":
+        for param in model.classifier.parameters():
+            param.requires_grad = True
+
+    # Loss function & optimizer
+    criterion = nn.CrossEntropyLoss().to(device)
+    if model_name == "resnet50":
+        optimizer = optim.SGD(model.fc.parameters(), lr=0.001, momentum=0.9)
+    elif model_name == "mobilenet_v3":
+        optimizer = optim.SGD(model.classifier.parameters(), lr=0.001, momentum=0.9)
+    elif model_name == "efficientnet_b3":
+        optimizer = optim.SGD(model.classifier.parameters(), lr=0.001, momentum=0.9)
+    elif model_name == "resnet18":
+        optimizer = optim.SGD(model.fc.parameters(), lr=0.001, momentum=0.9)
+    elif model_name == "vgg19":
+        optimizer = optim.SGD(model.classifier.parameters(), lr=0.001, momentum=0.9)
+
+    # Learning rate scheduler (Reduce LR on Plateau)
+    scheduler = lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.1, patience=3)
+
+    # Early stopping parameters
+    best_loss = float('inf')
+    epochs_no_improve = 0
+    
+    checkpoint_path = f"{model_name}_checkpoint_art.pth"
+    if os.path.exists(checkpoint_path):
+        print(f"Loading checkpoint for {model_name} from {checkpoint_path}")
+        model.load_state_dict(torch.load(checkpoint_path))
+    else:
+        print(f"No checkpoint found for {model_name}. Starting fresh.")
+
+    for epoch in range(num_epochs):
+        model.train()  # Set model to training mode
+        running_loss = 0.0
+        correct = 0
+        total = 0
+
+        pbar = tqdm(train_loader, desc=f"Epoch {epoch+1} | {model_name}")  # Progress bar
+
+        for i, (inputs, labels) in enumerate(pbar):
+            inputs, labels = inputs.to(device), labels.to(device)
+            optimizer.zero_grad()  # Zero gradients
+
+    
+            outputs = model(inputs)  # Forward pass
+            loss = criterion(outputs, labels)
+
+            loss.backward()  # Backpropagation
+            optimizer.step()  # Update weights
+
+            running_loss += loss.item()
+
+
+            # Compute accuracy
+            _, predicted = torch.max(outputs, 1)  # Get class with max probability
+            correct += (predicted == labels).sum().item()
+            total += labels.size(0)
+            accuracy = 100 * correct / total  
+
+            # Update progress bar with loss and accuracy
+            pbar.set_description(f"Epoch {epoch+1} | Loss: {running_loss / (i+1):.4f} | Accuracy: {accuracy:.2f}%")
+
+        # Compute average loss for the epoch
+        epoch_loss = running_loss / len(train_loader)
+        epoch_accuracy = 100 * correct / total
+
+        train_results.append([model_name, epoch+1, epoch_loss, epoch_accuracy])
+
+        # Learning rate scheduler step (reduce LR if loss plateaus)
+        scheduler.step(epoch_loss)
+
+        # Early stopping check
+        if epoch_loss < best_loss:
+            best_loss = epoch_loss
+            epochs_no_improve = 0 
+        else:
+            epochs_no_improve += 1
+            print(f"Early Stopping Patience: {epochs_no_improve}/{patience}")
+
+        if epochs_no_improve >= patience:
+            print(f"Early stopping triggered for {model_name}. Stopping training.")
+            break
+
+    # Save model checkpoint
+    torch.save(model.state_dict(), f"{model_name}_checkpoint_art.pth")
+
+    # Testing for this model
+    model.eval()  # Set model to evaluation mode
+    correct = 0
+    total = 0
+    i = 0
+
+    with torch.no_grad():  # No gradient computation
+        pbar = tqdm(test_loader, desc=f"Testing {model_name}")
+        for images, labels in pbar:
+            images, labels = images.to(device), labels.to(device)
+            outputs = model(images)  # Forward pass
+            _, predicted = torch.max(outputs, 1)  # Get predicted class
+            total += labels.size(0)
+            correct += (predicted == labels).sum().item()
+
+            # Update progress bar
+            pbar.set_description(f"Test minibatch {i+1} | Accuracy: {100.0 * correct / total:.2f}%")
+            i += 1
+
+    final_test_accuracy = 100.0 * correct / total
+    print(f'Final Test Accuracy for {model_name}: {final_test_accuracy:.2f}%')
+
+    # Save final test accuracy to the list
+    test_results.append([model_name, final_test_accuracy])
+
+# Save training results to a CSV file
+with open('training_results_art.csv', mode='w', newline='') as file:
+    writer = csv.writer(file)
+    writer.writerow(["Model", "Epoch", "Loss", "Accuracy"])
+    writer.writerows(train_results)
+
+with open('test_results_art.csv', mode='w', newline='') as file:
+    writer = csv.writer(file)
+    writer.writerow(["Model", "Test Accuracy"])
+    writer.writerows(test_results)
+
+print("Finished Training and Testing for all models.")
+
+
+################# results csv #################
+
+#training results
+train_df = pd.read_csv("training_results_art.csv")
+print("Training Results:")
+print(train_df)
+
+#test results
+test_df = pd.read_csv("test_results_art.csv")
+print("\nTest Results:")
+print(test_df)
