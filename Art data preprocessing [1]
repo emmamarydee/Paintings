@@ -33,17 +33,17 @@ def data_loader(batch_size=32, random_seed=2025, shuffle=True):
     
     train_dataset_stats = datasets.ImageFolder(root=training_path, transform=transform_for_stats)
     
-    #mean = 0.0
-    #std = 0.0
-    #for images, _ in tqdm(train_dataset_stats):
-    #    mean += images.mean([1, 2])
-    #   std += images.std([1, 2])
+    mean = 0.0
+    std = 0.0
+    for images, _ in tqdm(train_dataset_stats):
+        mean += images.mean([1, 2])
+       std += images.std([1, 2])
     
-    #mean /= len(train_dataset_stats)
-    #std /= len(train_dataset_stats)
+    mean /= len(train_dataset_stats)
+    std /= len(train_dataset_stats)
     
-    #print(f"Calculated mean: {mean}")
-    #print(f"Calculated std: {std}")
+    print(f"Calculated mean: {mean}")
+    print(f"Calculated std: {std}")
 
     # Define transformations for data augmentation
     train_transform = transforms.Compose([
