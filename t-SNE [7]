@@ -1,1 +1,304 @@
+####### t-SNE applied to l2-SP MobileNetV3 model #######
 
+
+import torch
+import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
+from tqdm import tqdm
+from sklearn.manifold import TSNE
+from torchvision import models
+import torch.nn as nn
+
+artist_names = [
+    "Cezanne", "Degas", "Gauguin", "Hassam", "Matisse", 
+    "Monet", "Pissarro", "Renoir", "Sargent", "VanGogh"
+]
+
+def extract_features_and_labels(model, dataloader, device):
+    model.eval()
+    features = []
+    labels = []
+
+    with torch.no_grad():
+        for inputs, targets in tqdm(dataloader, desc="Extracting Features"):
+            inputs, targets = inputs.to(device), targets.to(device)
+
+            # Get features from the penultimate layer (before classifier)
+            feature_vector = model.features(inputs)  # Extract CNN feature maps
+            feature_vector = torch.mean(feature_vector, dim=[2, 3])  # Global Average Pooling
+            features.append(feature_vector.cpu().numpy())
+            labels.append(targets.cpu().numpy())
+
+    features = np.vstack(features)  
+    labels = np.hstack(labels) 
+
+    return features, labels
+
+def visualise_tsne(model, dataloader, device, artist_names, n_components=2):
+    # Extract features and labels
+    features, labels = extract_features_and_labels(model, dataloader, device)
+
+    print("Applying t-SNE...")
+    tsne = TSNE(n_components=n_components, perplexity=30, random_state=2025)
+    reduced_features = tsne.fit_transform(features)
+    
+    
+
+    # Plot
+    plt.figure(figsize=(10, 8))
+    unique_labels = np.unique(labels)
+    colors = plt.cm.get_cmap("tab10", len(unique_labels))
+
+    for i, artist_id in enumerate(unique_labels):
+        idx = labels == artist_id
+        plt.scatter(reduced_features[idx, 0], reduced_features[idx, 1], 
+                    color=colors(i), label=artist_names[artist_id], alpha=0.7)
+
+    plt.legend(title="Artists", fontsize=10, loc="upper right")
+    scatter = plt.scatter(reduced_features[:, 0], reduced_features[:, 1], c=labels, cmap="tab10", alpha=0.7)
+    plt.title("t-SNE visualisation of test set paintings")
+    plt.xlabel("t-SNE dimension 1")
+    plt.ylabel("t-SNE dimension 2")
+    plt.show()
+
+# Load best model
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+model = models.mobilenet_v3_large(weights=models.MobileNet_V3_Large_Weights.DEFAULT)
+last_channel = model.classifier[0].in_features
+
+best_model_path = "checkpoints_mobilenet_l2sp/best_model.pt"
+checkpoint = torch.load(best_model_path, map_location=device)
+dropout_rate = checkpoint.get("dropout_rate", 0.25)
+
+#Model with classifier
+model.classifier = nn.Sequential(
+    nn.Linear(last_channel, 256),
+    nn.ReLU(),
+    nn.Dropout(dropout_rate),
+    nn.Linear(256, 10)
+)
+
+model.load_state_dict(checkpoint["model_state_dict"])
+model = model.to(device)
+
+
+visualise_tsne(model, test_loader, device, artist_names)
+
+
+################################## t-SNE plot with paintings  ################################## 
+import torch
+import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
+from tqdm import tqdm
+from sklearn.manifold import TSNE
+from torchvision import models
+import torch.nn as nn
+import cv2
+import os
+
+# Artist names
+artist_names = [
+    "Cezanne", "Degas", "Gauguin", "Hassam", "Matisse", 
+    "Monet", "Pissarro", "Renoir", "Sargent", "VanGogh"
+]
+
+def extract_features_and_labels(model, dataloader, device):
+    model.eval()
+    features = []
+    labels = []
+    image_indices = [] 
+    
+    idx = 0
+    with torch.no_grad():
+        for inputs, targets in tqdm(dataloader, desc="Extracting Features"):
+            inputs, targets = inputs.to(device), targets.to(device)
+            batch_size = inputs.size(0)
+
+            # Get features from the penultimate layer (before classifier)
+            feature_vector = model.features(inputs)  # Extract CNN feature maps
+            feature_vector = torch.mean(feature_vector, dim=[2, 3])  # Global Average Pooling
+            
+            features.append(feature_vector.cpu().numpy())
+            labels.append(targets.cpu().numpy())
+            
+            # Store indices for each image in the batch
+            image_indices.extend(list(range(idx, idx + batch_size)))
+            idx += batch_size
+
+    features = np.vstack(features)  
+    labels = np.hstack(labels) 
+
+    return features, labels, image_indices
+
+def scale_image(image, max_size):
+    h, w = image.shape[:2]
+    
+    # Scaling factor to maintain aspect ratio
+    scale = min(max_size / w, max_size / h)
+    
+    # New dimensions
+    new_h, new_w = int(h * scale), int(w * scale)
+    
+    # Resize the image
+    resized = cv2.resize(image, (new_w, new_h))
+    return resized
+
+def draw_rectangle_by_class(image, label, artist_names):
+    # Get colour for the artist/class
+    colors = plt.cm.get_cmap("tab10", len(artist_names))
+    color = colors(label)
+    
+    color = tuple(int(c * 255) for c in color[:3])
+    color = (color[2], color[1], color[0])
+    
+    # Coloured rectangle border
+    border_thickness = 5
+    h, w = image.shape[:2]
+    cv2.rectangle(image, (0, 0), (w-1, h-1), color, border_thickness)
+    
+    return image
+
+def compute_plot_coordinates(image, x, y, image_centers_area_size, offset):
+    image_height, image_width = image.shape[:2]
+ 
+    # Compute the image center coordinates on the plot
+    center_x = int(image_centers_area_size * x) + offset
+    center_y = int(image_centers_area_size * (1 - y)) + offset
+    tl_x = center_x - int(image_width / 2)
+    tl_y = center_y - int(image_height / 2)
+ 
+    br_x = tl_x + image_width
+    br_y = tl_y + image_height
+ 
+    return tl_x, tl_y, br_x, br_y
+
+def is_area_occupied(occupied_map, tl_x, tl_y, br_x, br_y):
+    return np.any(occupied_map[tl_y:br_y, tl_x:br_x])
+
+def add_legend(image, artist_names):
+    # Add a color legend to the plot
+    legend_height = 40
+    legend_width = 150
+    spacing = 20
+    colors = plt.cm.get_cmap("tab10", len(artist_names))
+    
+    for i, name in enumerate(artist_names):
+        # Get color for the artist
+        color = colors(i)
+        color = tuple(int(c * 255) for c in color[:3])
+        # OpenCV uses BGR format
+        color = (color[2], color[1], color[0])
+        
+        # Position for the legend entry
+        x = image.shape[1] - legend_width - 50
+        y = 50 + i * (legend_height + spacing)
+        
+        #Coloured boarders
+        cv2.rectangle(image, (x, y), (x + 30, y + 30), color, -1)
+        
+        # Add artist name
+        cv2.putText(image, name, (x + 40, y + 20), cv2.FONT_HERSHEY_SIMPLEX, 
+                    0.7, (0, 0, 0), 2)
+    
+    return image
+
+def visualise_tsne_with_images(model, dataloader, device, artist_names, dataset_paths, output_path="tsne_visualisation.jpg"):
+    # Extract features and labels
+    features, labels, indices = extract_features_and_labels(model, dataloader, device)
+    
+    # Get image paths
+    image_paths = [dataset_paths[i] for i in indices]
+    
+    print("Applying t-SNE...")
+    tsne = TSNE(n_components=2, perplexity=30, random_state=2025)
+    reduced_features = tsne.fit_transform(features)
+    
+    # Normalise t-SNE coordinates to [0, 1] range
+    tx = (reduced_features[:, 0] - reduced_features[:, 0].min()) / (reduced_features[:, 0].max() - reduced_features[:, 0].min())
+    ty = (reduced_features[:, 1] - reduced_features[:, 1].min()) / (reduced_features[:, 1].max() - reduced_features[:, 1].min())
+    
+    # Parameters for the plot
+    plot_size = 2000  # Size of the final image
+    max_image_size = 100  # Maximum size of a single painting thumbnail
+    image_centers_area_size = 1500  # Size of the area where image centers will be placed
+    offset = 250  # Offset from the borders
+    
+    # Initialise plots on white background
+    tsne_plot = 255 * np.ones((plot_size, plot_size, 3), np.uint8)
+    
+    # Track occupied areas to prevent overlapping
+    occupied = np.zeros((plot_size, plot_size), dtype=bool)
+    
+    # Place images on plot
+    for img_path, label, x, y in tqdm(zip(image_paths, labels, tx, ty), 
+                                    desc='Building the T-SNE plot',
+                                    total=len(image_paths)):
+
+        image = cv2.imread(img_path)
+        if image is None:
+            print(f"Warning: Could not read image {img_path}")
+            continue
+            
+        # Scale the image to fit in the plot
+        image = scale_image(image, max_image_size)
+        
+        # Coloured border based on the class/artist
+        image = draw_rectangle_by_class(image, label, artist_names)
+        
+
+        tl_x, tl_y, br_x, br_y = compute_plot_coordinates(
+            image, x, y, image_centers_area_size, offset)
+        
+
+        if (tl_x < 0 or tl_y < 0 or br_x >= plot_size or br_y >= plot_size):
+            continue
+            
+
+        if not is_area_occupied(occupied, tl_x, tl_y, br_x, br_y):
+            # Put the image on the plot
+            tsne_plot[tl_y:br_y, tl_x:br_x] = image
+            occupied[tl_y:br_y, tl_x:br_x] = True
+    
+
+    tsne_plot = add_legend(tsne_plot, artist_names)
+    
+    # Save the result
+    cv2.imwrite(output_path, tsne_plot)
+    
+    # Display the result (optional)
+    plt.figure(figsize=(12, 12))
+    plt.imshow(cv2.cvtColor(tsne_plot, cv2.COLOR_BGR2RGB))
+    plt.axis('off')
+    plt.tight_layout()
+    plt.show()
+    
+    print(f"T-SNE visualisation saved to {output_path}")
+
+
+# Load best model
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+model = models.mobilenet_v3_large(weights=models.MobileNet_V3_Large_Weights.DEFAULT)
+last_channel = model.classifier[0].in_features
+
+best_model_path = "checkpoints_mobilenet_l2sp/best_model.pt"
+checkpoint = torch.load(best_model_path, map_location=device)
+dropout_rate = checkpoint.get("dropout_rate", 0.25)
+
+
+model.classifier = nn.Sequential(
+    nn.Linear(last_channel, 256),
+    nn.ReLU(),
+    nn.Dropout(dropout_rate),
+    nn.Linear(256, 10)
+)
+
+model.load_state_dict(checkpoint["model_state_dict"])
+model = model.to(device)
+
+# Image path from testset
+dataset_paths = [sample[0] for sample in test_loader.dataset.samples]
+
+
+visualise_tsne_with_images(model, test_loader, device, artist_names, dataset_paths, output_path="tsne_artists_visualisation.jpg")
