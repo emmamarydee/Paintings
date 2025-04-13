@@ -1,0 +1,90 @@
+############## Grad-CAM for the MobilNetV3 fine-tuned architecture with weight regularisation ########
+
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import torchvision
+from torchvision import models, transforms
+import os
+import cv2
+import numpy as np
+import matplotlib.pyplot as plt
+
+
+def preprocess_image(img_path, device):
+    img = cv2.imread(img_path, cv2.IMREAD_COLOR)
+    img = cv2.resize(img, (224, 224))  # Resize for MobileNetV2
+    img = transforms.ToTensor()(img)
+    img = transforms.Normalize(mean=[0.5229, 0.4610, 0.3803], 
+                                std=[0.2049, 0.1918, 0.1819])(img)
+    img = img.unsqueeze(0) 
+    return img.to(device)  
+
+def evaluate_best_model_on_test_set(checkpoint_dir="checkpoints_mobilenet", return_model=True):
+    
+    
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    best_model_path = os.path.join(checkpoint_dir, "best_model.pt")
+    if not os.path.exists(best_model_path):
+        print(f"Error: Best model not found at {best_model_path}.")
+        return None
+    
+    print(f"Loading model from {best_model_path}...")
+    checkpoint = torch.load(best_model_path, map_location=device)
+    
+    # Load model
+    print("Initializing model...")
+    model = models.mobilenet_v3_large(weights=models.MobileNet_V3_Large_Weights.DEFAULT)
+    last_channel = model.classifier[0].in_features
+    
+    dropout_rate = checkpoint.get('dropout_rate', 0.28)
+    
+    model.classifier = nn.Sequential(
+        nn.Linear(last_channel, 256),
+        nn.ReLU(),
+        nn.Dropout(dropout_rate),
+        nn.Linear(256, 10)
+    )
+    
+    model.load_state_dict(checkpoint['model_state_dict'])
+    model = model.to(device)
+    model.eval()
+
+    return model, device if return_model else (None, device)
+
+
+if __name__ == "__main__":
+    # Load the model
+    model, device = evaluate_best_model_on_test_set()
+    
+    if model is None:
+        print("Failed to load the model. Exiting.")
+        exit()
+
+    img_path = "213390.jpg"  
+    img_tensor = preprocess_image(img_path, device)
+    
+    #Model predictions
+    with torch.no_grad():
+        preds = model(img_tensor)
+    class_index = get_class_label(preds)
+ 
+    print(f"Predicted Class Index: {class_index}")
+ 
+    # Compute Grad-CAM heatmap
+    heatmap = compute_gradcam(model, img_tensor, class_index)
+ 
+    # Overlay heatmap on the original image
+    output_img = overlay_heatmap(img_path, heatmap)
+ 
+    # Save the heatmap
+    cv2.imwrite("heatmap/2.jpg", output_img)
+    
+
+    output_img_rgb = cv2.cvtColor(output_img, cv2.COLOR_BGR2RGB)  
+    plt.imshow(output_img_rgb)
+    plt.axis('off')
+    plt.show()
+
+
+
