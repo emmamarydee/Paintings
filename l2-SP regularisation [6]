@@ -17,7 +17,7 @@ from skopt import Optimizer
 from skopt.space import Real
 
 RESULTS_FILE = "bayesian_optimisation_results_mobilenet_art_dropout_l2sp.csv"
-CHECKPOINT_FILE = "optimization_checkpoint_dropout_l2sp.json"
+CHECKPOINT_FILE = "optimisation_checkpoint_dropout_l2sp.json"
 LR_PATIENCE = 2
 ES_PATIENCE = 5
 CHECKPOINT_INTERVAL = 5  # Save checkpoint every 5 epochs
@@ -220,3 +220,86 @@ if results:
     print(f"Dropout rate: {best_params[0]:.4f}")
     print(f"L2-SP reg: {best_params[1]:.6f}")
     print(f"Validation loss: {best_params[2]:.4f}")
+
+
+############ loading best model and evaluating on test set ############
+
+def evaluate_best_model_on_test_set(test_loader, checkpoint_dir="checkpoints_mobilenet_l2sp"):
+    print("Starting evaluation...") 
+    
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+    best_model_path = os.path.join(checkpoint_dir, "best_model.pt")
+    if not os.path.exists(best_model_path):
+        print(f"Error: Best model not found at {best_model_path}.")
+        return
+
+    print(f"Loading model from {best_model_path}...")  # Debugging print
+    checkpoint = torch.load(best_model_path)
+    
+    # Load model
+
+    model = models.mobilenet_v3_large(weights=models.MobileNet_V3_Large_Weights.DEFAULT)
+    last_channel = model.classifier[0].in_features
+    
+    dropout_rate = checkpoint.get('dropout_rate', 0.2503743328827471)
+    
+    model.classifier = nn.Sequential(
+        nn.Linear(last_channel, 256),
+        nn.ReLU(),
+        nn.Dropout(dropout_rate),
+        nn.Linear(256, 10)
+    )
+    
+    model.load_state_dict(checkpoint['model_state_dict'])
+    model = model.to(device)
+    model.eval()
+
+    print("Model successfully loaded, starting inference...")  # Debugging print
+
+    # Evaluate
+    all_preds = []
+    all_labels = []
+
+    with torch.no_grad():
+        for inputs, labels in tqdm(test_loader, desc="Evaluating on Test Set"):
+            inputs, labels = inputs.to(device), labels.to(device)
+            outputs = model(inputs)
+            _, predicted = torch.max(outputs, 1)
+
+            all_preds.extend(predicted.cpu().numpy())
+            all_labels.extend(labels.cpu().numpy())
+
+    print("Inference complete, calculating metrics...")  # Debugging print
+
+    # Calculate metrics
+    precision = precision_score(all_labels, all_preds, average='weighted')
+    recall = recall_score(all_labels, all_preds, average='weighted')
+    f1 = f1_score(all_labels, all_preds, average='weighted')
+    accuracy = accuracy_score(all_labels, all_preds)
+
+    print("\nEvaluation Results on Test Set:")
+    print(f"  Accuracy: {accuracy:.4f}")
+    print(f"  Precision: {precision:.4f}")
+    print(f"  Recall: {recall:.4f}")
+    print(f"  F1-Score: {f1:.4f}")
+    print(f"  L2 SP: {checkpoint.get('l2sp_reg', 0.0):.6f}")
+    print(f"  Dropout Rate: {dropout_rate:.4f}")
+
+    # Generate confusion matrix
+    cm = confusion_matrix(all_labels, all_preds)
+    print("\nConfusion Matrix:")
+    print(cm)
+
+    # Plot confusion matrix
+    plt.figure(figsize=(10, 8))
+    sns.heatmap(cm, annot=True, fmt='g', cmap='viridis_r', cbar=False,
+                xticklabels=artist_names, yticklabels=artist_names)
+    plt.title('Confusion Matrix')
+    plt.xlabel('Predicted')
+    plt.ylabel('True')
+    plt.xticks(rotation=45)
+    plt.yticks(rotation=45)
+    plt.show()
+
+evaluate_best_model_on_test_set(test_loader)
