@@ -1,0 +1,166 @@
+import os, csv, numpy as np, torch, torch.nn as nn, torch.optim as optim
+from torch.optim import lr_scheduler
+from torchvision import models
+import matplotlib.pyplot as plt
+from tqdm.auto import tqdm
+from sklearn.metrics import precision_score, recall_score, f1_score
+from typing import Dict
+
+#Model architecture 
+EPOCHS = 10
+BASE_LR = 1e-3
+WEIGHT_DECAY = 0.0
+DROPOUT_RATE = 0.3
+DEFAULT_ALPHA_VALUES = [0.0, 0.01, 0.05, 0.1, 0.5, 1.0]
+HOYER_ALPHA_VALUES = [0.0, 0.0001, 0.001, 0.005, 0.01]
+LAYERS_TO_UNFREEZE = ["layer2", "layer3", "layer4", "fc"]
+SPARSITY_TYPES = {
+    "L1": None,
+    "HoyerSquare": None,
+    "TransformedL1_1e-2": 1e-2,
+    "TransformedL1_1e-4": 1e-4
+}
+
+PLOTS_DIR = "plots"
+CKPT_DIR = "checkpoints"
+RESULTS_CSV = "results_all_sparsity_metrics_resnet50.csv"
+os.makedirs(PLOTS_DIR, exist_ok=True)
+os.makedirs(CKPT_DIR, exist_ok=True)
+
+def set_seed(seed=2025):
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    np.random.seed(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+set_seed()
+
+#Sparisty regularisers 
+def l1_regulariser(acts):
+    return sum(a.abs().mean() for a in acts.values())
+
+def hoyer_square(acts):
+    reg = 0.0
+    for a in acts.values():
+        a_flat = a.view(a.size(0), -1)
+        l1 = a_flat.abs().sum(dim=1)
+        l2 = torch.sqrt((a_flat**2).sum(dim=1) + 1e-8)
+        reg += ((l1 / l2)**2).mean()
+    return reg
+
+def transformed_l1(acts, beta):
+    return sum(((1 + beta) * a.abs() / (beta + a.abs())).mean() for a in acts.values())
+
+#Initalise model
+class ActRegResNet50(nn.Module):
+    def __init__(self, num_classes=10, alpha=0.0, sparse_type="L1", beta=None):
+        super().__init__()
+        self.alpha = alpha
+        self.sparse_type = sparse_type
+        self.beta = beta
+        self.base = models.resnet50(weights=models.ResNet50_Weights.DEFAULT)
+
+        in_f = self.base.fc.in_features
+        self.base.fc = nn.Sequential(
+            nn.Linear(in_f, 256),
+            nn.ReLU(inplace=True),
+            nn.Dropout(DROPOUT_RATE),
+            nn.Linear(256, num_classes),
+        )
+
+        self.act_maps = {}
+        for name, mod in self.base.named_modules():
+            if isinstance(mod, nn.ReLU):
+                mod.register_forward_hook(self._capture(name))
+
+    def _capture(self, name):
+        def hook(_, __, out): self.act_maps[name] = out
+        return hook
+
+    def forward(self, x):
+        self.act_maps.clear()
+        return self.base(x)
+
+    def act_reg_loss(self):
+        if self.alpha == 0 or not self.act_maps:
+            return torch.zeros(1, device=next(self.parameters()).device, requires_grad=True).squeeze()
+        if self.sparse_type == "L1":
+            return self.alpha * l1_regulariser(self.act_maps)
+        elif self.sparse_type == "HoyerSquare":
+            return self.alpha * hoyer_square(self.act_maps)
+        elif self.sparse_type.startswith("TransformedL1"):
+            return self.alpha * transformed_l1(self.act_maps, self.beta)
+
+    @torch.no_grad()
+    def layer_sparsity(self):
+        return {k: (v == 0).float().mean().item() * 100 for k, v in self.act_maps.items()}
+
+
+def sort_layer_keys(layers):
+    return sorted(layers, key=lambda x: (
+        0 if x.startswith('conv1') else
+        1 if x.startswith('layer1') else
+        2 if x.startswith('layer2') else
+        3 if x.startswith('layer3') else
+        4 if x.startswith('layer4') else
+        5 if x.startswith('fc') else
+        6, x))
+
+
+def plot_sparsity_histogram(sparsity, alpha, reg_type):
+    names = sort_layer_keys(sparsity.keys())
+    vals = [sparsity[n] for n in names]
+    plt.figure(figsize=(12, 6))
+    plt.bar(names, vals)
+    plt.xticks(rotation=90)
+    plt.ylabel("Sparsity (%)")
+    plt.title(f"Sparsity per Layer | α={alpha} | {reg_type}")
+    plt.tight_layout()
+    plt.savefig(f"{PLOTS_DIR}/resnet50_sparsity_{reg_type}_alpha_{alpha}.png")
+    plt.close()
+
+def plot_combined_histograms(all_sparsities, reg_type):
+    plt.figure(figsize=(16, 8))
+    all_layer_names = set()
+    for sparsity in all_sparsities.values():
+        all_layer_names.update(sparsity.keys())
+    layer_names = sort_layer_keys(all_layer_names)
+    width = 0.8 / len(all_sparsities)
+    x = np.arange(len(layer_names))
+    for i, (alpha, sparsity) in enumerate(all_sparsities.items()):
+        vals = [sparsity.get(l, 0.0) for l in layer_names]
+        plt.bar(x + i * width, vals, width, label=f"α={alpha}")
+    plt.xticks(x + width * len(all_sparsities)/2, layer_names, rotation=90)
+    plt.ylabel("Sparsity (%)")
+    plt.title(f"Combined Sparsity Plot — {reg_type}")
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(f"{PLOTS_DIR}/resnet50_combined_sparsity_{reg_type}.png")
+    plt.close()
+
+
+def run_all_experiments(train_loader, valid_loader, test_loader):
+    all_results = []
+    for reg_type, beta in SPARSITY_TYPES.items():
+        all_sparsities = {}
+        alpha_list = HOYER_ALPHA_VALUES if reg_type == "HoyerSquare" else DEFAULT_ALPHA_VALUES
+        for alpha in alpha_list:
+            print(f"\n Training with {reg_type},  α = {alpha}")
+            sparsity, metrics = train_model(train_loader, valid_loader, test_loader, alpha, reg_type, beta)
+            all_sparsities[alpha] = sparsity
+            plot_sparsity_histogram(sparsity, alpha, reg_type)
+            all_results.append(dict(
+                alpha=alpha,
+                reg_type=reg_type,
+                beta=beta if beta is not None else "-",
+                **metrics
+            ))
+        plot_combined_histograms(all_sparsities, reg_type)
+
+    with open(RESULTS_CSV, "w", newline="") as f:
+        wr = csv.DictWriter(f, fieldnames=["reg_type", "beta", "alpha", "loss", "accuracy", "precision", "recall", "f1"])
+        wr.writeheader()
+        wr.writerows(all_results)
+
+# Call main
+run_all_experiments(train_loader, valid_loader, test_loader)
